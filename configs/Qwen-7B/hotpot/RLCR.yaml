@@ -1,0 +1,98 @@
+# Unified HotPotQA comparison config (RLVR / RLCR / RLSR) — paper protocol:
+# LoRA r=1 @ lr 1e-5, generation pool 8 x 4 x 64 = 2048, seed 43, TIS off.
+# The three method configs are textually identical in keys and comments; ONLY
+# run_name / output_dir / reward_weights differ, so every run logs the same
+# per-reward wandb statistics and eval AURC metrics.
+# Reward weights over [format, accuracy, batch_rlsr, brier, mean_confidence,
+# confidence_one_or_zero] (+ trailing 0.0 for the auto-added aurc_collector),
+# with eps = 1e-6 meaning monitoring-only:
+#   RLVR: [0.5, 0.5, eps, eps, eps, eps, 0.0]   (format + accuracy)
+#   RLCR: [0.5, 0.5, eps, 0.5, eps, eps, 0.0]   (format + accuracy + Brier)
+#   RLSR: [0.5, eps, 0.5, eps, eps, eps, 0.0]   (format + selection reward)
+
+# Model arguments
+model_name_or_path: Qwen/Qwen2.5-7B
+run_name: "RLCR-hotpot"
+output_dir: data/RLCR-hotpot
+model_revision: main
+torch_dtype: bfloat16
+attn_implementation: flash_attention_2
+
+# LoRA/PEFT configuration (LoRA without Regret: rank=1 for RL)
+use_peft: true
+lora_r: 1
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules: all-linear
+lora_task_type: CAUSAL_LM
+
+# Data training arguments
+dataset_name: mehuldamani/hotpot_qa
+
+# GRPO trainer config (identical across RLVR/RLCR/RLSR)
+bf16: true
+beta: 0.0
+disable_dropout: true  # For stable logprobs (TRL best practice)
+steps_per_generation: null  # Auto-computed from gradient_accumulation_steps
+eval_strategy: "steps"
+eval_steps: 50
+eval_on_start: false
+format_pattern: "tabc"
+gradient_accumulation_steps: 64  # 4 GPUs x 8 batch x 64 = 2048-completion pool
+eval_accumulation_steps: null
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: true
+hub_strategy: "end"
+learning_rate: 1e-5
+log_level: info
+logging_steps: 5
+logging_strategy: steps
+
+# Logging configuration (RLCR behavior)
+log_completions: true  # Log (prompt, completion) samples to wandb
+num_completions_to_print: 3
+wandb_log_unique_prompts: false  # Log all prompts, not just unique ones
+
+lr_scheduler_type: constant_with_warmup
+max_prompt_length: 3072
+max_completion_length: 1536
+max_steps: -1
+num_generations: 32
+num_iterations: 1
+num_train_epochs: 1
+per_device_eval_batch_size: 8
+per_device_train_batch_size: 8
+push_to_hub: false
+wandb_project: RLSR
+report_to:
+- wandb
+
+# Batch-level RLSR reward parameters (the reward is computed in every run for
+# comparable logging; its training influence is set by reward_weights)
+batch_rlsr_lambda: 1.0
+batch_rlsr_max_weight: null  # null = no clipping (alpha-hat <= H_2048 ~ 8.20)
+
+reward_funcs: ["format", "accuracy", "batch_rlsr", "brier", "mean_confidence", "confidence_one_or_zero"]
+reward_weights: [0.5, 0.5, 0.000001, 0.5, 0.000001, 0.000001, 0.0]
+
+save_strategy: "steps"
+save_steps: 60
+save_total_limit: 5
+scale_rewards: false
+seed: 43
+sys_prompt_name: "tabc_long"
+temperature: 0.7
+
+# vLLM configuration (trl >= 0.23). TIS off: reduces trl's estimator to ratio=1
+# at num_iterations=1, matching the vintage RLCR trainer's plain policy gradient.
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.4
+vllm_enable_sleep_mode: true
+vllm_importance_sampling_correction: false
+
+# DeepSpeed ZeRO-3 support (inert under ZeRO-2; kept for config parity)
+ds3_gather_for_generation: false
+
+warmup_ratio: 0.05

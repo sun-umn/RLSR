@@ -1,0 +1,174 @@
+Patch against upstream RLCR @ be2624b. Apply from inside the submodule:
+    cd RLCR && git apply ../rlcr.patch
+
+1. arguments.py  - trl 0.23 compatibility: scale_rewards is a string field
+   ("none"/"group"/"batch"); the generation_batch_size/steps_per_generation
+   both-set guard is evaluated on user-configured values BEFORE
+   super().__post_init__() (trl >= 0.18 resolves both in the parent, which
+   made the original check fire unconditionally).
+2. reward_fns.py - answer normalization: MCQ letter/text matching for MedQA
+   and source-aware branching in accuracy_reward (hotpot behavior unchanged).
+
+diff --git a/arguments.py b/arguments.py
+index c08f583..3b787f9 100644
+--- a/arguments.py
++++ b/arguments.py
+@@ -257,12 +257,11 @@ class GRPOConfig(trl.GRPOConfig):
+         },
+     )
+ 
+-    scale_rewards: bool = field(
+-        default=True,
++    scale_rewards: str = field(
++        default="none",
+         metadata={
+-            "help": "Whether to scale the rewards by dividing them by their standard deviation. If `True` (default), "
+-            "the rewards are normalized by the standard deviation, ensuring they have unit variance. If `False`, no "
+-            "scaling is applied. The Dr. GRPO paper recommends not scaling the rewards, as scaling by the standard "
++            "help": "How to scale rewards by standard deviation. Options: 'batch' (batch-level std), 'group' (per-prompt std), "
++            "'none'/'false' (no scaling). The Dr. GRPO paper recommends not scaling the rewards, as scaling by the standard "
+             "deviation introduces a question-level difficulty bias."
+         },
+     )
+@@ -273,13 +272,17 @@ class GRPOConfig(trl.GRPOConfig):
+     )
+ 
+     def __post_init__(self):
++        # trl >= 0.18 resolves steps_per_generation/generation_batch_size inside
++        # super().__post_init__() with the same formulas as below, so the both-set
++        # guard must be evaluated on the user-configured values captured beforehand.
++        user_set_both = self.generation_batch_size is not None and self.steps_per_generation is not None
+         super().__post_init__()
+ 
+         print("Post init on the config")
+ 
+         num_processes = self.world_size
+         # The current default effective batch size
+-        if self.generation_batch_size is not None and self.steps_per_generation is not None:
++        if user_set_both:
+             raise ValueError(
+                 "'generation_batch_size' and 'steps_per_generation' can not be both configured at the same time"
+             )
+diff --git a/reward_fns.py b/reward_fns.py
+index 5b6d5a7..a3cf1fa 100644
+--- a/reward_fns.py
++++ b/reward_fns.py
+@@ -1,8 +1,70 @@
+ import math
+ import re
+ from math_verify import verify,parse
+-import numpy as np 
++import numpy as np
+ import string
++from typing import Optional, Tuple, Dict
++
++# Valid MCQ options for MedQA
++VALID_MCQ_OPTIONS = {"A", "B", "C", "D"}
++
++
++def normalize_mcq_answer(raw_answer: str, options: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], str]:
++    """
++    Normalize MCQ answer to a single letter (A, B, C, D).
++
++    Handles various formats:
++    - "D" -> "D"
++    - "Nitrofurantoin" -> "D" (if matches option D text)
++    - "D. Nitrofurantoin" -> "D"
++    - "D: Nitrofurantoin" -> "D"
++    - "The answer is D" -> "D"
++    - "Option D" -> "D"
++
++    Returns:
++        Tuple of (normalized_letter, pattern_type)
++    """
++    if not raw_answer:
++        return None, "empty"
++
++    raw_answer = raw_answer.strip()
++
++    # Pattern 1: Just a letter
++    if raw_answer.upper() in VALID_MCQ_OPTIONS:
++        return raw_answer.upper(), "letter_only"
++
++    # Pattern 2: "D." or "D:" or "D)" at the start
++    letter_prefix = re.match(r'^([A-D])[\.\:\)\s]', raw_answer.upper())
++    if letter_prefix:
++        return letter_prefix.group(1), "letter_prefix"
++
++    # Pattern 3: "The answer is D" or "Option D" or "Choice D"
++    answer_pattern = re.search(
++        r'(?:answer|option|choice)\s*(?:is\s*)?([A-D])',
++        raw_answer,
++        re.IGNORECASE
++    )
++    if answer_pattern:
++        return answer_pattern.group(1).upper(), "answer_is"
++
++    # Pattern 4: Match against option text (if options provided)
++    if options:
++        raw_lower = raw_answer.lower().strip()
++        for letter, text in options.items():
++            if raw_lower == text.lower().strip():
++                return letter, "text_match"
++            # Partial match (answer text contains option text or vice versa)
++            if text.lower().strip() in raw_lower or raw_lower in text.lower().strip():
++                return letter, "text_partial"
++
++    # Pattern 5: Look for any standalone letter in the answer
++    standalone_letter = re.search(r'\b([A-D])\b', raw_answer.upper())
++    if standalone_letter:
++        return standalone_letter.group(1), "letter_embedded"
++
++    # Could not extract
++    return None, "unknown"
++
+ 
+ def normalize_answer(s):
+ 
+@@ -35,6 +97,9 @@ def format_reward(format_pattern,completions, **kwargs):
+         pattern = r".*?</think>\s*<answer>.*?</answer>\s*<confidence>.*?</confidence>\s*\Z" 
+     elif format_pattern == "tabc":
+         pattern = r".*?</think>\s*<answer>.*?</answer>\s*<analysis>.*?</analysis>\s*<confidence>.*?</confidence>\s*\Z"
++    elif format_pattern == "tabc_lenient":
++        # Accepts both tabc (with <analysis>) and tac (without) — for E1 format sensitivity eval
++        pattern = r".*?</think>\s*<answer>.*?</answer>\s*(?:<analysis>.*?</analysis>\s*)?<confidence>.*?</confidence>\s*\Z"
+     confidence_pattern = r"<confidence>(.*?)</confidence>"
+ 
+     completion_contents = [completion[0]["content"] for completion in completions]
+@@ -66,18 +131,29 @@ def accuracy_reward(format_pattern,completions,answer,source=None,**kwargs):
+     """Reward function that extracts the last occurrence of text inside the answer tags and then checks if a label is present there"""
+     ans_pattern = r"<answer>(.*?)</answer>"
+     completion_contents = [completion[0]["content"] for completion in completions]
+-    eval_contents = [e for e in answer] 
++    eval_contents = [e for e in answer]
+     matches = []
+-    format_rewards = format_reward(format_pattern,completions) 
+-    
+-    for content,e,fr in zip(completion_contents,eval_contents,format_rewards):
++    format_rewards = format_reward(format_pattern,completions)
++
++    # Get options for MCQ text matching (MedQA)
++    options_list = kwargs.get('options', None)
++
++    for idx, (content, e, fr) in enumerate(zip(completion_contents, eval_contents, format_rewards)):
+         if fr == 0:
+-            matches.append(0) 
++            matches.append(0)
+         else:
+             ans_matches = re.findall(ans_pattern, content, re.DOTALL | re.MULTILINE)  # Get all <answer>...</answer> occurrences
+             last_answer = ans_matches[-1] if ans_matches else ""  # Get the last answer, if exists
+-            #if source exists in key and is equal to hotpot, then use the exact match score
+-            if source is not None and source[0] == 'hotpot':
++            #if source exists in key and is equal to medqa, use MCQ normalization
++            if source is not None and source[0] == 'medqa':
++                # Get options for this sample (if available)
++                sample_options = options_list[idx] if options_list else None
++                normalized_letter, _ = normalize_mcq_answer(last_answer, sample_options)
++                if normalized_letter is not None:
++                    label = 1.0 if normalized_letter.upper() == e.upper() else 0.0
++                else:
++                    label = 0.0
++            elif source is not None and source[0] == 'hotpot':
+                 label = exact_match_score(last_answer,e)
+             else:
+                 attempt = parse(last_answer)
